@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import FrozenSet
+from typing import FrozenSet, List
 
 from .data_generator import DUPLICATE_TX_IDS
 from .models import VerdictPayload
@@ -8,6 +8,59 @@ from .models import VerdictPayload
 # Ground-truth duplicate TX IDs for Task 2
 TASK2_GROUND_TRUTH_IDS: FrozenSet[str] = frozenset(DUPLICATE_TX_IDS)
 
+# ---------------------------------------------------------------------------
+# Upgrade 1: ChainEval — verifiable symbolic reasoning trace
+# ---------------------------------------------------------------------------
+# The Task3 hard grader now verifies the agent followed the correct causal
+# chain: Net Income Up → OCF Down → AR Spike → non_gaap_manipulation.
+# This ensures genuine multi-step reasoning, not pattern matching.
+
+TASK3_CAUSAL_CHAIN = [
+    # (evidence_key, direction, description)
+    ("income_statement_net_income", "positive", "Net Income increased"),
+    ("cashflow_operating_cash",     "negative", "Operating Cash Flow declined"),
+    ("balance_sheet_ar",            "positive", "Accounts Receivable spiked"),
+]
+
+
+def _verify_causal_chain(evidence_chain: List[dict], scratchpad: List[dict]) -> bool:
+    """
+    ChainEval: verify the agent's evidence follows the symbolic causal trace.
+    Each step in TASK3_CAUSAL_CHAIN must appear in evidence with correct direction.
+    """
+    combined = str(evidence_chain).lower() + " " + str(scratchpad).lower()
+
+    checks = {
+        "income_statement_net_income": any(k in combined for k in (
+            "net_income", "net income", "income_statement_net_income",
+        )),
+        "cashflow_operating_cash": any(k in combined for k in (
+            "operating_cash", "cashflow_operating", "ocf", "operating cash flow",
+        )),
+        "balance_sheet_ar": any(k in combined for k in (
+            "accounts_receivable", "balance_sheet_ar", "accounts receivable", "ar_spike",
+        )),
+    }
+    return all(checks.values())
+
+
+def _chain_alignment_score(evidence_chain: List[dict], scratchpad: List[dict]) -> float:
+    """
+    Returns 0.0–1.0 based on how many causal chain steps are present.
+    Partial credit for partial chains.
+    """
+    combined = str(evidence_chain).lower() + " " + str(scratchpad).lower()
+    step_checks = [
+        any(k in combined for k in ("net_income", "net income", "income_statement_net_income")),
+        any(k in combined for k in ("operating_cash", "cashflow_operating", "ocf")),
+        any(k in combined for k in ("accounts_receivable", "balance_sheet_ar", "ar_spike")),
+    ]
+    return sum(step_checks) / len(step_checks)
+
+
+# ---------------------------------------------------------------------------
+# Task 1 Grader
+# ---------------------------------------------------------------------------
 
 class Task1_Grader:
     """KPI Extraction & Multi-Modal Linking grader."""
@@ -60,6 +113,10 @@ class Task1_Grader:
         return False
 
 
+# ---------------------------------------------------------------------------
+# Task 2 Grader
+# ---------------------------------------------------------------------------
+
 class Task2_Grader:
     """Cross-System Reconciliation Audit grader (F1-style)."""
 
@@ -75,20 +132,16 @@ class Task2_Grader:
 
     def _extract_flagged_ids(self, verdict: VerdictPayload) -> FrozenSet[str]:
         ids: set[str] = set()
-        # From flagged_tx_ids field
         if verdict.flagged_tx_ids:
             ids.update(verdict.flagged_tx_ids)
-        # From evidence_chain entries
         for entry in verdict.evidence_chain:
             tx = entry.get("tx_id") or entry.get("transaction_id") or entry.get("id")
             if tx:
                 ids.add(str(tx))
-            # Also check lists
             for key in ("tx_ids", "duplicate_ids", "flagged_ids"):
                 val = entry.get(key)
                 if isinstance(val, list):
                     ids.update(str(v) for v in val)
-        # From scratchpad
         for entry in verdict.scratchpad:
             tx = entry.get("tx_id") or entry.get("source") or entry.get("target")
             if tx and str(tx).startswith("tx_"):
@@ -96,41 +149,40 @@ class Task2_Grader:
         return frozenset(ids)
 
 
+# ---------------------------------------------------------------------------
+# Task 3 Grader — with ChainEval (Upgrade 1)
+# ---------------------------------------------------------------------------
+
 class Task3_Grader:
-    """Narrative vs. Numeric Deception Detection grader (partial scoring)."""
+    """
+    Narrative vs. Numeric Deception Detection grader.
+
+    Upgrade 1 — ChainEval: scores the agent's evidence_chain against the
+    symbolic causal trace: Net Income Up → OCF Down → AR Spike.
+    Partial credit is awarded based on chain alignment score (0.0–1.0).
+    Full score requires: all 3 chain steps + correct verdict + valid rationale.
+    """
 
     REQUIRED_CONCLUSION: str = "non_gaap_manipulation"
     RATIONALE_KEYWORDS: list[str] = ["accounts receivable", "cash flow", "revenue recognition"]
 
     def grade(self, verdict: VerdictPayload) -> float:
-        has_evidence = self._check_evidence(verdict)
+        chain_score = _chain_alignment_score(verdict.evidence_chain, verdict.scratchpad)
+        has_all_evidence = chain_score == 1.0
         correct_conclusion = verdict.conclusion == self.REQUIRED_CONCLUSION
         valid_rationale = self._check_rationale(verdict.rationale)
 
-        if has_evidence and correct_conclusion and valid_rationale:
+        if has_all_evidence and correct_conclusion and valid_rationale:
             return 1.0
-        elif has_evidence and correct_conclusion:
+        elif has_all_evidence and correct_conclusion:
             return 0.7
-        elif has_evidence:
+        elif has_all_evidence:
             return 0.4
+        elif chain_score > 0.0:
+            # Partial credit: proportional to chain alignment
+            return round(chain_score * 0.3, 3)
         else:
             return 0.0
-
-    def _check_evidence(self, verdict: VerdictPayload) -> bool:
-        chain_str = str(verdict.evidence_chain).lower()
-        scratchpad_str = str(verdict.scratchpad).lower()
-        combined = chain_str + " " + scratchpad_str
-
-        has_net_income = any(k in combined for k in (
-            "net_income", "net income", "income_statement_net_income",
-        ))
-        has_ocf = any(k in combined for k in (
-            "operating_cash", "cashflow_operating", "ocf", "operating cash flow",
-        ))
-        has_ar = any(k in combined for k in (
-            "accounts_receivable", "balance_sheet_ar", "accounts receivable", "ar_spike",
-        ))
-        return has_net_income and has_ocf and has_ar
 
     def _check_rationale(self, rationale: str) -> bool:
         if not rationale:

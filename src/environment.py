@@ -88,6 +88,33 @@ class RewardComputer:
             return 1.0 if evidence_complete else 0.5
         return 0.0
 
+    # ------------------------------------------------------------------
+    # Upgrade 2: Six Sigma Redundancy Reward
+    # Reward +0.3 when agent verifies the same financial fact across
+    # multiple independent data sources (GL + narrative, or CF + BS).
+    # This trains agents toward High-Reliability Organization (HRO) standards.
+    # ------------------------------------------------------------------
+
+    def delta_redundancy(self, source_id: str, scratchpad: list[Dict]) -> float:
+        """
+        +0.3 if this link corroborates a fact already in the scratchpad
+        from a different data source (cross-system verification).
+        """
+        CROSS_SOURCE_PAIRS = [
+            ("income_statement", "narrative"),
+            ("cashflow", "balance_sheet"),
+            ("general_ledger", "sub_ledger"),
+            ("general_ledger", "narrative"),
+            ("cashflow", "narrative"),
+        ]
+        src_lower = source_id.lower()
+        for existing in scratchpad:
+            existing_src = str(existing.get("source_id", "")).lower()
+            for a, b in CROSS_SOURCE_PAIRS:
+                if (a in src_lower and b in existing_src) or (b in src_lower and a in existing_src):
+                    return 0.3
+        return 0.0
+
     def clamp(self, reward: float) -> float:
         return max(self.CLAMP_MIN, min(self.CLAMP_MAX, reward))
 
@@ -274,6 +301,8 @@ class ForensicAuditEnv:
             "relationship": action.relationship,
         }
         delta = self._reward.delta_link_evidence(link, self._scratchpad)
+        # Upgrade 2: Six Sigma redundancy reward for cross-source verification
+        delta += self._reward.delta_redundancy(action.source_id, self._scratchpad)
         self._scratchpad.append(link)
         return delta
 
@@ -341,17 +370,46 @@ class ForensicAuditEnv:
         view = self._current_view
 
         if view == "income_statement":
-            return cd.income_statement.model_dump()
+            data = cd.income_statement.model_dump()
+            # Upgrade 3: enrich with narrative description for unstructured reasoning
+            data["_narrative_summary"] = (
+                f"Revenue of ${data['revenue']/1e6:.1f}M with operating margin "
+                f"{data['operating_margin']*100:.1f}%. Net income ${data['net_income']/1e6:.1f}M."
+            )
+            return data
         elif view == "balance_sheet":
-            return cd.balance_sheet.model_dump()
+            data = cd.balance_sheet.model_dump()
+            data["_narrative_summary"] = (
+                f"Total assets ${data['total_assets']/1e6:.1f}M. "
+                f"Accounts receivable ${data['accounts_receivable']/1e6:.1f}M "
+                f"({data['accounts_receivable']/data['total_assets']*100:.1f}% of assets). "
+                f"Equity ${data['equity']/1e6:.1f}M."
+            )
+            return data
         elif view == "cashflow":
-            return cd.cashflow.model_dump()
+            data = cd.cashflow.model_dump()
+            ocf = data["operating_cash_flow"]
+            data["_narrative_summary"] = (
+                f"Operating cash flow ${ocf/1e6:.1f}M "
+                f"({'positive — healthy cash generation' if ocf > 0 else 'NEGATIVE — cash burn despite reported profits'}). "
+                f"Investing ${data['investing_cash_flow']/1e6:.1f}M, "
+                f"Financing ${data['financing_cash_flow']/1e6:.1f}M."
+            )
+            return data
         elif view == "narrative":
-            return cd.narrative.model_dump()
+            data = cd.narrative.model_dump()
+            # Upgrade 3: add a flat text summary of all chunks for easier agent parsing
+            data["_full_text"] = " | ".join(
+                f"[{c['chunk_id']}] {c['text']}" for c in data.get("chunks", [])
+            )
+            return data
         elif view in ("general_ledger", "sub_ledger"):
-            # Return last query results if available, else empty
             results = getattr(self, "_visible_query_results", [])
-            return {"rows": results, "hint": "Use query_ledger action to filter transactions"}
+            return {
+                "rows": results,
+                "row_count": len(results),
+                "hint": "Use query_ledger action to filter transactions. Filters: account_code, date_from, date_to, amount_min, amount_max, vendor_id",
+            }
         return {}
 
     # ------------------------------------------------------------------
