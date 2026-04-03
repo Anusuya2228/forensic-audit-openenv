@@ -1,0 +1,33 @@
+name: forensic-audit-env
+version: "1.0.0"
+description: "Forensic accounting RL environment for financial anomaly detection"
+endpoints:
+  reset:
+    method: POST
+    path: /reset
+  step:
+    method: POST
+    path: /step
+  state:
+    method: GET
+    path: /state
+observation_space:
+  type: object
+  fields:
+    - current_view
+    - visible_data
+    - scratchpad
+    - available_actions
+    - anomaly_alerts
+    - investigation_progress
+action_space:
+  types:
+    - navigate
+    - query_ledger
+    - link_evidence
+    - issue_verdict
+episode:
+  max_steps: 15
+reward:
+  min: -2.0
+  max: 3.0

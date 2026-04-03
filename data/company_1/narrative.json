@@ -1,0 +1,75 @@
+{
+  "company": "TechCorp",
+  "period": "FY2024",
+  "chunks": [
+    {
+      "chunk_id": "n1",
+      "text": "Revenue grew 15% YoY driven by strong demand across all segments.",
+      "referenced_kpis": [
+        "revenue"
+      ]
+    },
+    {
+      "chunk_id": "n2",
+      "text": "Net income reached $108.8M, reflecting disciplined cost management.",
+      "referenced_kpis": [
+        "net_income"
+      ]
+    },
+    {
+      "chunk_id": "n3",
+      "text": "The company continued to invest in R&D and capital expenditures.",
+      "referenced_kpis": []
+    },
+    {
+      "chunk_id": "n4",
+      "text": "Accounts payable increased modestly as supplier terms were renegotiated.",
+      "referenced_kpis": [
+        "accounts_payable"
+      ]
+    },
+    {
+      "chunk_id": "n5",
+      "text": "Gross margin remained stable at approximately 45%, in line with prior year.",
+      "referenced_kpis": [
+        "gross_margin"
+      ]
+    },
+    {
+      "chunk_id": "n6",
+      "text": "The balance sheet remains strong with a healthy equity ratio.",
+      "referenced_kpis": [
+        "equity"
+      ]
+    },
+    {
+      "chunk_id": "n7",
+      "text": "Operating margin was 14.4%, reflecting ongoing efficiency initiatives.",
+      "referenced_kpis": [
+        "operating_margin"
+      ]
+    },
+    {
+      "chunk_id": "n8",
+      "text": "Operating cash flow was $56.9M, supporting ongoing investment activities.",
+      "referenced_kpis": [
+        "operating_cash_flow"
+      ]
+    },
+    {
+      "chunk_id": "n9",
+      "text": "A healthy 15% increase in vehicle deliveries drove revenue growth this quarter.",
+      "referenced_kpis": [
+        "revenue",
+        "deliveries"
+      ]
+    },
+    {
+      "chunk_id": "n10",
+      "text": "Accounts receivable increased to $128.6M as new enterprise contracts were signed.",
+      "referenced_kpis": [
+        "accounts_receivable"
+      ]
+    }
+  ]
+}
