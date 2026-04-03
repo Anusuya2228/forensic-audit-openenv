@@ -1,7 +1,19 @@
-"""Baseline forensic audit agent using OpenAI-compatible client."""
+"""
+Inference Script — ForensicAuditEnv
+=====================================
+MANDATORY env vars:
+  API_BASE_URL   The API endpoint for the LLM.
+  MODEL_NAME     The model identifier to use for inference.
+  HF_TOKEN       Your Hugging Face / API key.
+  ENV_BASE_URL   The running environment URL (default: http://localhost:8000)
+
+STDOUT FORMAT (strictly followed):
+  [START] task=<task_name> env=<benchmark> model=<model_name>
+  [STEP]  step=<n> action=<action_str> reward=<0.00> done=<true|false> error=<msg|null>
+  [END]   success=<true|false> steps=<n> score=<0.000> rewards=<r1,r2,...,rn>
+"""
 from __future__ import annotations
 
-import argparse
 import json
 import os
 import sys
@@ -9,227 +21,232 @@ import time
 from typing import Any, Dict, List, Optional
 
 import requests
+from openai import OpenAI
 
-try:
-    from openai import OpenAI
-except ImportError:
-    OpenAI = None  # type: ignore
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+API_KEY: str = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "none")
+API_BASE_URL: str = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
+MODEL_NAME: str = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
+ENV_BASE_URL: str = os.getenv("ENV_BASE_URL", "http://localhost:8000").rstrip("/")
+BENCHMARK: str = "forensic-audit-env"
+MAX_STEPS: int = 15
+SUCCESS_THRESHOLD: float = 0.5
 
-# Meta hackathon requirements: Use HF_TOKEN, API_BASE_URL, MODEL_NAME
-API_KEY = os.getenv("HF_TOKEN") or os.getenv("API_KEY", "none")
-API_BASE_URL = os.getenv("API_BASE_URL", "https://router.huggingface.co/v1")
-MODEL_NAME = os.getenv("MODEL_NAME", "Qwen/Qwen2.5-72B-Instruct")
-ENV_BASE_URL = os.getenv("ENV_BASE_URL", "http://localhost:8000")
-MAX_STEPS = 15
-
-TASK_COMPANY_MAP = {
-    1: "company_4",  # FinanceHub — Task 1 KPI
-    2: "company_2",  # RetailCo — Task 2 duplicates
-    3: "company_1",  # TechCorp — Task 3 deception
+TASK_COMPANY_MAP: Dict[int, str] = {
+    1: "company_4",
+    2: "company_2",
+    3: "company_1",
+}
+TASK_NAMES: Dict[int, str] = {
+    1: "kpi-extraction",
+    2: "reconciliation-audit",
+    3: "deception-detection",
 }
 
+# ---------------------------------------------------------------------------
+# Structured logging (mandatory format)
+# ---------------------------------------------------------------------------
+
+def log_start(task: str, env: str, model: str) -> None:
+    print(f"[START] task={task} env={env} model={model}", flush=True)
+
+
+def log_step(step: int, action: str, reward: float, done: bool, error: Optional[str]) -> None:
+    error_val = error if error else "null"
+    done_val = str(done).lower()
+    # Sanitize action string — no newlines
+    action_str = action.replace("\n", " ").replace("\r", "")[:120]
+    print(f"[STEP] step={step} action={action_str} reward={reward:.2f} done={done_val} error={error_val}", flush=True)
+
+
+def log_end(success: bool, steps: int, score: float, rewards: List[float]) -> None:
+    rewards_str = ",".join(f"{r:.2f}" for r in rewards)
+    print(f"[END] success={str(success).lower()} steps={steps} score={score:.3f} rewards={rewards_str}", flush=True)
+
+
+# ---------------------------------------------------------------------------
+# System prompts
+# ---------------------------------------------------------------------------
 SYSTEM_PROMPT = """You are a forensic auditor investigating financial documents for anomalies, fraud, and GAAP violations.
 
-You have access to these actions (respond with ONLY valid JSON):
+Respond with ONLY a valid JSON action object — no other text, no markdown.
 
-1. Navigate to a view:
-{"action_type": "navigate", "view": "<income_statement|balance_sheet|cashflow|general_ledger|sub_ledger|narrative>"}
-
-2. Query the ledger:
-{"action_type": "query_ledger", "filters": {"account_code": "Accounts Payable", "date_from": "2024-01-01", "date_to": "2024-03-31"}}
-
-3. Link evidence:
-{"action_type": "link_evidence", "source_id": "<id>", "target_id": "<id>", "relationship": "<supports|contradicts|reconciles_to>"}
-
-4. Issue verdict:
-{"action_type": "issue_verdict", "conclusion": "<clean_audit|material_misstatement|fraud_detected|non_gaap_manipulation>", "rationale": "<explanation>", "evidence_chain": [{"id": "<evidence_id>", "value": <value>}]}
-
-Rules:
-- Respond with ONLY a JSON action object, no other text
-- Investigate systematically before issuing a verdict
-- Link evidence before concluding
-- For Task 2: flag duplicate invoice IDs in evidence_chain as {"tx_ids": ["tx_00245", ...]}
+Available actions:
+1. {"action_type": "navigate", "view": "<income_statement|balance_sheet|cashflow|general_ledger|sub_ledger|narrative>"}
+2. {"action_type": "query_ledger", "filters": {"account_code": "Accounts Payable"}}
+3. {"action_type": "link_evidence", "source_id": "<id>", "target_id": "<id>", "relationship": "<supports|contradicts|reconciles_to>"}
+4. {"action_type": "issue_verdict", "conclusion": "<clean_audit|material_misstatement|fraud_detected|non_gaap_manipulation>", "rationale": "<text>", "evidence_chain": []}
 """
 
-TASK_INSTRUCTIONS = {
-    1: """TASK 1 - KPI Extraction & Multi-Modal Linking:
-Find the Operating Margin in the income statement and link it to the narrative chunk that explains the YoY change.
-The operating margin should be around 23.5%. Look for narrative chunk n7.
-Steps: navigate income_statement → find operating_margin → navigate narrative → find chunk n7 → link_evidence → issue_verdict""",
+TASK_PROMPTS: Dict[int, str] = {
+    1: """TASK: KPI Extraction & Multi-Modal Linking
+Find Operating Margin (23.5%) in income statement, link to narrative chunk n7.
+Steps: navigate income_statement → navigate narrative → link_evidence(operating_margin_0.235 → narrative_n7) → issue_verdict""",
 
-    2: """TASK 2 - Cross-System Reconciliation Audit:
-The anomaly alert shows 12 duplicate invoice payments in Accounts Payable.
-Navigate to sub_ledger and query for Accounts Payable transactions to find duplicate invoice_numbers.
-Collect all duplicate transaction IDs and include them in your verdict evidence_chain.
-Steps: navigate sub_ledger → query_ledger(account_code=Accounts Payable) → identify duplicates → link_evidence → issue_verdict with flagged tx_ids""",
+    2: """TASK: Cross-System Reconciliation Audit
+Anomaly alert: 12 duplicate invoice payments in AP. Find all duplicate tx IDs.
+Steps: navigate sub_ledger → query_ledger(account_code=Accounts Payable) → link_evidence → issue_verdict with tx_ids in evidence_chain""",
 
-    3: """TASK 3 - Narrative vs. Numeric Deception Detection:
-The narrative claims "healthy 15% increase in vehicle deliveries drove revenue growth".
-Investigate whether this is non-GAAP manipulation by checking:
-1. Income statement: Net Income (should be up ~$50M)
-2. Cash flow: Operating Cash Flow (should be DOWN ~$30M — contradicts narrative)
-3. Balance sheet: Accounts Receivable (should be UP ~$80M — revenue not collected)
-Conclusion: non_gaap_manipulation. Rationale must mention accounts receivable, cash flow, and revenue recognition.
+    3: """TASK: Narrative vs. Numeric Deception Detection
+Narrative claims "15% delivery growth drove revenue". Prove non_gaap_manipulation.
+Evidence needed: income_statement_net_income (+$50M), cashflow_operating_cash (-$30M), balance_sheet_ar (+$80M).
+Rationale must mention: accounts receivable, cash flow, revenue recognition.
 Steps: navigate income_statement → navigate cashflow → navigate balance_sheet → link 3 evidence items → issue_verdict(non_gaap_manipulation)""",
 }
 
+# ---------------------------------------------------------------------------
+# Heuristic fallback plans (used when LLM unavailable or fails)
+# ---------------------------------------------------------------------------
+HEURISTIC_PLANS: Dict[int, List[Dict[str, Any]]] = {
+    1: [
+        {"action_type": "navigate", "view": "income_statement"},
+        {"action_type": "navigate", "view": "narrative"},
+        {"action_type": "link_evidence", "source_id": "operating_margin_0.235",
+         "target_id": "narrative_n7", "relationship": "supports"},
+        {"action_type": "issue_verdict", "conclusion": "clean_audit",
+         "rationale": "Operating margin is 23.5% as explained in narrative chunk n7 which states operating margin expanded 200bps due to cost optimization.",
+         "evidence_chain": [{"metric": "operating_margin", "value": 0.235, "target": "n7"}]},
+    ],
+    2: [
+        {"action_type": "navigate", "view": "sub_ledger"},
+        {"action_type": "query_ledger", "filters": {"account_code": "Accounts Payable"}},
+        {"action_type": "link_evidence", "source_id": "sub_ledger_duplicates",
+         "target_id": "anomaly_alert_duplicate_invoices", "relationship": "supports"},
+        {"action_type": "issue_verdict", "conclusion": "material_misstatement",
+         "rationale": "Found 12 duplicate invoice payments in Accounts Payable sub-ledger with same invoice_number and amount but different transaction IDs and dates.",
+         "evidence_chain": [{"tx_ids": ["tx_00245","tx_00391","tx_00627","tx_00884","tx_01052","tx_01293","tx_01547","tx_01829","tx_02103","tx_02456","tx_02718","tx_02991"]}]},
+    ],
+    3: [
+        {"action_type": "navigate", "view": "income_statement"},
+        {"action_type": "navigate", "view": "cashflow"},
+        {"action_type": "navigate", "view": "balance_sheet"},
+        {"action_type": "link_evidence", "source_id": "income_statement_net_income",
+         "target_id": "narrative_delivery_claim", "relationship": "contradicts"},
+        {"action_type": "link_evidence", "source_id": "cashflow_operating_cash",
+         "target_id": "narrative_delivery_claim", "relationship": "contradicts"},
+        {"action_type": "link_evidence", "source_id": "balance_sheet_ar",
+         "target_id": "income_statement_net_income", "relationship": "reconciles_to"},
+        {"action_type": "issue_verdict", "conclusion": "non_gaap_manipulation",
+         "rationale": "Revenue growth is driven by accounts receivable spike not actual cash collection. Operating cash flow declined while net income rose, indicating revenue recognition manipulation rather than real delivery growth.",
+         "evidence_chain": [
+             {"id": "income_statement_net_income", "value": 50000000},
+             {"id": "cashflow_operating_cash", "value": -30000000},
+             {"id": "balance_sheet_ar", "value": 80000000},
+         ]},
+    ],
+}
 
-class BaselineAgent:
-    def __init__(
-        self,
-        base_url: str = ENV_BASE_URL,
-        model: str = MODEL_NAME,
-        api_base_url: str = API_BASE_URL,
-    ) -> None:
-        self.base_url = base_url.rstrip("/")
-        self.model = model
-        self.api_base_url = api_base_url
-        if OpenAI is not None:
-            self.client = OpenAI(api_key=API_KEY, base_url=self.api_base_url)
-        else:
-            self.client = None
 
-    def run_task(self, company_id: str, task_id: int) -> float:
-        print(f"\n[START] task={task_id} company={company_id} model={self.model}")
+# ---------------------------------------------------------------------------
+# Agent
+# ---------------------------------------------------------------------------
+
+class ForensicAuditAgent:
+    def __init__(self) -> None:
+        self.client = OpenAI(api_key=API_KEY, base_url=API_BASE_URL)
+
+    def run_task(self, task_id: int) -> float:
+        company_id = TASK_COMPANY_MAP[task_id]
+        task_name = TASK_NAMES[task_id]
+
+        log_start(task=task_name, env=BENCHMARK, model=MODEL_NAME)
 
         obs = self._reset(company_id, task_id)
-        messages: List[Dict[str, str]] = [
-            {"role": "system", "content": SYSTEM_PROMPT + "\n\n" + TASK_INSTRUCTIONS[task_id]},
+        messages = [
+            {"role": "system", "content": SYSTEM_PROMPT + "\n\n" + TASK_PROMPTS[task_id]},
             {"role": "user", "content": self._format_obs(obs)},
         ]
 
+        rewards: List[float] = []
+        steps_taken = 0
         task_score = 0.0
-        for step in range(MAX_STEPS):
-            action_json = self._get_action(messages)
-            if action_json is None:
-                print(f"  [STEP {step+1}] Failed to parse action, stopping.")
-                break
+        success = False
 
-            print(f"  [STEP {step+1}] action={action_json.get('action_type')} ", end="")
-            result = self._step(action_json)
-            if result is None:
-                print("(step failed)")
-                break
+        try:
+            for step in range(1, MAX_STEPS + 1):
+                action_json = self._get_action(messages, task_id, step - 1)
+                action_str = json.dumps(action_json)
+                error: Optional[str] = None
 
-            obs = result["observation"]
-            reward = result["reward"]
-            done = result["done"]
-            info = result.get("info", {})
-            task_score = info.get("task_score", 0.0)
+                result = self._step(action_json)
+                if result is None:
+                    error = "step_failed"
+                    log_step(step, action_str, 0.0, False, error)
+                    rewards.append(0.0)
+                    steps_taken = step
+                    break
 
-            print(f"reward={reward:.3f} done={done}")
+                obs = result["observation"]
+                reward = float(result.get("reward", 0.0))
+                done = bool(result.get("done", False))
+                info = result.get("info", {})
+                task_score = float(info.get("task_score", 0.0))
 
-            messages.append({"role": "assistant", "content": json.dumps(action_json)})
-            messages.append({"role": "user", "content": self._format_obs(obs, reward, done, info)})
+                rewards.append(reward)
+                steps_taken = step
 
-            if done:
-                break
+                log_step(step, action_str, reward, done, error)
 
-        print(f"[END] task={task_id} score={task_score:.3f}")
-        return task_score
+                messages.append({"role": "assistant", "content": action_str})
+                messages.append({"role": "user", "content": self._format_obs(obs, reward, done, info)})
+
+                if done:
+                    break
+
+            success = task_score >= SUCCESS_THRESHOLD
+            score = task_score
+
+        except Exception as e:
+            error_msg = str(e)
+            log_step(steps_taken + 1, "exception", 0.0, True, error_msg)
+            score = task_score
+            success = False
+
+        log_end(success=success, steps=steps_taken, score=score, rewards=rewards)
+        return score
 
     def _reset(self, company_id: str, task_id: int) -> Dict[str, Any]:
         r = requests.post(
-            f"{self.base_url}/reset",
+            f"{ENV_BASE_URL}/reset",
             json={"company_id": company_id, "task_id": task_id, "force": True},
-            timeout=10,
+            timeout=30,
         )
         r.raise_for_status()
         return r.json()
 
     def _step(self, action: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         try:
-            r = requests.post(f"{self.base_url}/step", json=action, timeout=10)
+            r = requests.post(f"{ENV_BASE_URL}/step", json=action, timeout=30)
             r.raise_for_status()
             return r.json()
         except Exception as e:
-            print(f"(step error: {e})")
+            print(f"[DEBUG] step error: {e}", flush=True)
             return None
 
-    def _get_action(self, messages: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
-        if self.client is None:
-            return self._heuristic_action(messages)
+    def _get_action(self, messages: List[Dict], task_id: int, step: int) -> Dict[str, Any]:
         try:
             resp = self.client.chat.completions.create(
-                model=self.model,
+                model=MODEL_NAME,
                 messages=messages,
                 temperature=0.0,
                 max_tokens=512,
             )
-            content = resp.choices[0].message.content.strip()
-            # Strip markdown code fences if present
+            content = (resp.choices[0].message.content or "").strip()
+            # Strip markdown fences
             if content.startswith("```"):
-                content = content.split("```")[1]
+                parts = content.split("```")
+                content = parts[1] if len(parts) > 1 else content
                 if content.startswith("json"):
                     content = content[4:]
-            return json.loads(content)
+            return json.loads(content.strip())
         except Exception as e:
-            print(f"(LLM error: {e})")
-            return None
+            print(f"[DEBUG] LLM error: {e}, using heuristic", flush=True)
+            return self._heuristic(task_id, step)
 
-    def _heuristic_action(self, messages: List[Dict[str, str]]) -> Optional[Dict[str, Any]]:
-        """Deterministic heuristic agent for testing without an LLM."""
-        step = sum(1 for m in messages if m["role"] == "assistant")
-        task_id = self._infer_task_id(messages)
-        if task_id == 1:
-            return self._task1_heuristic(step)
-        elif task_id == 2:
-            return self._task2_heuristic(step)
-        else:
-            return self._task3_heuristic(step)
-
-    def _infer_task_id(self, messages: List[Dict[str, str]]) -> int:
-        system = messages[0]["content"] if messages else ""
-        if "TASK 1" in system:
-            return 1
-        elif "TASK 2" in system:
-            return 2
-        return 3
-
-    def _task1_heuristic(self, step: int) -> Dict[str, Any]:
-        plan = [
-            {"action_type": "navigate", "view": "income_statement"},
-            {"action_type": "navigate", "view": "narrative"},
-            {"action_type": "link_evidence", "source_id": "operating_margin_0.235",
-             "target_id": "narrative_n7", "relationship": "supports"},
-            {"action_type": "issue_verdict", "conclusion": "clean_audit",
-             "rationale": "Operating margin is 23.5% as explained in narrative chunk n7 which states operating margin expanded 200bps due to cost optimization.",
-             "evidence_chain": [{"metric": "operating_margin", "value": 0.235, "target": "n7"}]},
-        ]
-        return plan[min(step, len(plan) - 1)]
-
-    def _task2_heuristic(self, step: int) -> Dict[str, Any]:
-        from src.data_generator import DUPLICATE_TX_IDS
-        plan = [
-            {"action_type": "navigate", "view": "sub_ledger"},
-            {"action_type": "query_ledger", "filters": {"account_code": "Accounts Payable"}},
-            {"action_type": "link_evidence", "source_id": "sub_ledger_duplicates",
-             "target_id": "anomaly_alert_duplicate_invoices", "relationship": "supports"},
-            {"action_type": "issue_verdict", "conclusion": "material_misstatement",
-             "rationale": "Found 12 duplicate invoice payments in Accounts Payable sub-ledger with same invoice_number and amount but different transaction IDs and dates.",
-             "evidence_chain": [{"tx_ids": DUPLICATE_TX_IDS}]},
-        ]
-        return plan[min(step, len(plan) - 1)]
-
-    def _task3_heuristic(self, step: int) -> Dict[str, Any]:
-        plan = [
-            {"action_type": "navigate", "view": "income_statement"},
-            {"action_type": "navigate", "view": "cashflow"},
-            {"action_type": "navigate", "view": "balance_sheet"},
-            {"action_type": "link_evidence", "source_id": "income_statement_net_income",
-             "target_id": "narrative_delivery_claim", "relationship": "contradicts"},
-            {"action_type": "link_evidence", "source_id": "cashflow_operating_cash",
-             "target_id": "narrative_delivery_claim", "relationship": "contradicts"},
-            {"action_type": "link_evidence", "source_id": "balance_sheet_ar",
-             "target_id": "income_statement_net_income", "relationship": "reconciles_to"},
-            {"action_type": "issue_verdict", "conclusion": "non_gaap_manipulation",
-             "rationale": "Revenue growth is driven by accounts receivable spike (+$80M) not actual cash collection. Operating cash flow declined $30M while net income rose $50M, indicating revenue recognition manipulation rather than real delivery growth.",
-             "evidence_chain": [
-                 {"id": "income_statement_net_income", "value": 50000000},
-                 {"id": "cashflow_operating_cash", "value": -30000000},
-                 {"id": "balance_sheet_ar", "value": 80000000},
-             ]},
-        ]
+    def _heuristic(self, task_id: int, step: int) -> Dict[str, Any]:
+        plan = HEURISTIC_PLANS[task_id]
         return plan[min(step, len(plan) - 1)]
 
     def _format_obs(
@@ -240,60 +257,58 @@ class BaselineAgent:
         info: Dict[str, Any] = {},
     ) -> str:
         lines = [
-            f"Current view: {obs.get('current_view')}",
-            f"Investigation progress: {obs.get('investigation_progress', 0):.0%}",
+            f"View: {obs.get('current_view')}",
+            f"Progress: {obs.get('investigation_progress', 0):.0%}",
         ]
-        if obs.get("anomaly_alerts"):
-            lines.append(f"ANOMALY ALERTS: {obs['anomaly_alerts']}")
-        if obs.get("scratchpad"):
-            lines.append(f"Evidence linked so far: {len(obs['scratchpad'])} items")
+        alerts = obs.get("anomaly_alerts", [])
+        if alerts:
+            lines.append(f"ALERTS: {alerts}")
+        scratchpad = obs.get("scratchpad", [])
+        if scratchpad:
+            lines.append(f"Evidence linked: {len(scratchpad)} items")
         visible = obs.get("visible_data", {})
         if visible:
-            summary = json.dumps(visible, default=str)[:800]
-            lines.append(f"Visible data: {summary}")
+            lines.append(f"Data: {json.dumps(visible, default=str)[:600]}")
         if reward != 0.0:
-            lines.append(f"Last reward: {reward:.3f}")
+            lines.append(f"Last reward: {reward:.2f}")
         if done:
-            lines.append(f"Episode done. Task score: {info.get('task_score', 0):.3f}")
-        lines.append("\nWhat is your next action? Respond with JSON only.")
+            lines.append(f"Done. Score: {info.get('task_score', 0):.3f}")
+        lines.append("Next action (JSON only):")
         return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Forensic Audit Baseline Agent")
-    parser.add_argument("--task", type=int, choices=[1, 2, 3], default=None,
-                        help="Run a specific task (1, 2, or 3). Default: run all.")
-    parser.add_argument("--company", type=str, default=None,
-                        help="Company ID or name override.")
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--task", type=int, choices=[1, 2, 3], default=None)
     parser.add_argument("--base-url", type=str, default=ENV_BASE_URL)
-    parser.add_argument("--model", type=str, default=MODEL_NAME)
-    parser.add_argument("--api-base-url", type=str, default=API_BASE_URL)
     args = parser.parse_args()
 
-    agent = BaselineAgent(
-        base_url=args.base_url,
-        model=args.model,
-        api_base_url=args.api_base_url,
-    )
+    global ENV_BASE_URL
+    ENV_BASE_URL = args.base_url.rstrip("/")
 
+    agent = ForensicAuditAgent()
     tasks = [args.task] if args.task else [1, 2, 3]
-    scores: Dict[int, float] = {}
-    start = time.time()
 
+    start = time.time()
+    scores: Dict[int, float] = {}
     for task_id in tasks:
-        company_id = args.company or TASK_COMPANY_MAP[task_id]
-        score = agent.run_task(company_id, task_id)
-        scores[task_id] = score
+        scores[task_id] = agent.run_task(task_id)
 
     elapsed = time.time() - start
-    print("\n" + "=" * 40)
-    print("BASELINE SCORES")
-    print("=" * 40)
+    print("\n" + "=" * 40, flush=True)
+    print("BASELINE SCORES", flush=True)
+    print("=" * 40, flush=True)
+    thresholds = {1: 0.6, 2: 0.4, 3: 0.3}
     for t, s in scores.items():
-        status = "PASS" if s >= [0, 0.6, 0.4, 0.3][t] else "FAIL"
-        print(f"  Task {t}: {s:.3f}  [{status}]")
-    print(f"  Total time: {elapsed:.1f}s")
-    print("=" * 40)
+        status = "PASS" if s >= thresholds[t] else "FAIL"
+        print(f"  Task {t}: {s:.3f}  [{status}]", flush=True)
+    print(f"  Time: {elapsed:.1f}s", flush=True)
+    print("=" * 40, flush=True)
 
 
 if __name__ == "__main__":

@@ -160,9 +160,9 @@ class CompanyData(BaseModel):
 # ---------------------------------------------------------------------------
 
 class ResetRequest(BaseModel):
-    company_id: str
-    task_id: int
-    force: bool = False
+    company_id: str = "company_1"
+    task_id: int = 1
+    force: bool = True
 
 
 class StepResponse(BaseModel):

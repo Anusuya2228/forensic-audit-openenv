@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastapi import Body, FastAPI, HTTPException
 
@@ -32,7 +32,10 @@ def health() -> Dict[str, Any]:
 
 
 @app.post("/reset", response_model=AuditObservation)
-def reset(request: ResetRequest) -> AuditObservation:
+def reset(request: Optional[ResetRequest] = Body(default=None)) -> AuditObservation:
+    """Reset the environment. Body is optional — defaults to company_1, task_id=1."""
+    if request is None:
+        request = ResetRequest(company_id="company_1", task_id=1, force=True)
     try:
         return env.reset(request.company_id, request.task_id, force=request.force)
     except EpisodeActiveError as e:
@@ -78,3 +81,4 @@ def step(action: Dict[str, Any] = Body(...)) -> StepResponse:
 @app.get("/state", response_model=AuditObservation)
 def state() -> AuditObservation:
     return env.get_state()
+
