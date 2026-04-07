@@ -144,7 +144,8 @@ HEURISTIC_PLANS: Dict[int, List[Dict[str, Any]]] = {
 # ---------------------------------------------------------------------------
 
 class ForensicAuditAgent:
-    def __init__(self) -> None:
+    def __init__(self, base_url: str = ENV_BASE_URL) -> None:
+        self.base_url = base_url.rstrip("/")
         self.client = OpenAI(api_key=API_KEY, base_url=API_BASE_URL)
 
     def run_task(self, task_id: int) -> float:
@@ -209,7 +210,7 @@ class ForensicAuditAgent:
 
     def _reset(self, company_id: str, task_id: int) -> Dict[str, Any]:
         r = requests.post(
-            f"{ENV_BASE_URL}/reset",
+            f"{self.base_url}/reset",
             json={"company_id": company_id, "task_id": task_id, "force": True},
             timeout=30,
         )
@@ -218,7 +219,7 @@ class ForensicAuditAgent:
 
     def _step(self, action: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         try:
-            r = requests.post(f"{ENV_BASE_URL}/step", json=action, timeout=30)
+            r = requests.post(f"{self.base_url}/step", json=action, timeout=30)
             r.raise_for_status()
             return r.json()
         except Exception as e:
@@ -285,13 +286,11 @@ def main() -> None:
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", type=int, choices=[1, 2, 3], default=None)
-    parser.add_argument("--base-url", type=str, default=ENV_BASE_URL)
+    parser.add_argument("--base-url", type=str, default=None)
     args = parser.parse_args()
 
-    global ENV_BASE_URL
-    ENV_BASE_URL = args.base_url.rstrip("/")
-
-    agent = ForensicAuditAgent()
+    base_url = (args.base_url or ENV_BASE_URL).rstrip("/")
+    agent = ForensicAuditAgent(base_url=base_url)
     tasks = [args.task] if args.task else [1, 2, 3]
 
     start = time.time()
